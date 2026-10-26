@@ -61,6 +61,9 @@ class RunpodProvider(Provider):
             help="Network volume id to mount at /workspace. The weights are "
                  "downloaded to it once and reused by later runs and by every "
                  "pod in this run. Pods start in the volume's data center.")
+        group.add_argument("--runpod_gpu_count", type=int, default=1,
+                           help="GPUs per pod. infer.py uses every GPU it "
+                                "sees (stage 2 runs on the extra ones).")
         group.add_argument("--runpod_disk_gb", type=int, default=100,
                            help="Container disk in GB. Holds the code, weights, "
                                 "clips, outputs, and --low_vram feature files.")
@@ -126,7 +129,8 @@ class RunpodProvider(Provider):
         failures = []
         # v2 takes one GPU type per create, so the fallback order is ours.
         for gpu in self.args.runpod_gpu or DEFAULT_GPUS:
-            body["gpu"] = {"id": gpu, "count": 1, "minCudaVersion": MIN_CUDA_VERSION}
+            body["gpu"] = {"id": gpu, "count": self.args.runpod_gpu_count,
+                           "minCudaVersion": MIN_CUDA_VERSION}
             try:
                 pod = self._request("POST", "/pods", body)
             except RunpodAPIError as e:
@@ -136,7 +140,9 @@ class RunpodProvider(Provider):
                 continue
             cost = pod.get("cost")
             price = f" at ${cost:.2f}/hr" if cost else ""
-            print(f"[runpod] created pod {pod['id']} ({gpu}{price})", flush=True)
+            count = self.args.runpod_gpu_count
+            label = f"{count}x {gpu}" if count > 1 else gpu
+            print(f"[runpod] created pod {pod['id']} ({label}{price})", flush=True)
             return pod["id"]
         raise RuntimeError("no GPU type could be rented:\n  " + "\n  ".join(failures))
 

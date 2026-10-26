@@ -278,6 +278,7 @@ class RunpodProviderTest(unittest.TestCase):
         args = mock.Mock(runpod_gpu=flags.get("gpus"), runpod_image="img",
                          runpod_cloud_type="SECURE",
                          runpod_network_volume=flags.get("volume"),
+                         runpod_gpu_count=flags.get("gpu_count", 1),
                          runpod_disk_gb=100)
         calls = []
 
@@ -310,6 +311,11 @@ class RunpodProviderTest(unittest.TestCase):
         self.assertEqual(body["disk"], 100)
         self.assertEqual(provider.workdir, "/corridorkey-remote")
         self.assertNotIn("dataCenterIds", body)
+
+    def test_gpu_count_is_sent_for_multi_gpu_pods(self):
+        provider, calls, _ = self.provider([{"id": "pod1"}], gpus=["GPU A"], gpu_count=2)
+        provider.create("ck", "key")
+        self.assertEqual(calls[-1][2]["gpu"]["count"], 2)
 
     def test_reports_every_gpu_when_none_can_be_rented(self):
         from remote.providers.runpod.provider import RunpodAPIError

@@ -36,6 +36,7 @@ script prints each pod's GPU and hourly price when it starts it.
 |---|---|---|
 | `--runpod_gpu` | 48 GB cards (RTX A6000, A40, L40, RTX 6000 Ada, L40S), then RTX 4090, RTX 5090, RTX PRO 6000, and A100 80GB | GPU types to try, in order. Repeat the flag to give your own list. |
 | `--runpod_network_volume` | none | Network volume to keep the weights on between runs. |
+| `--runpod_gpu_count` | 1 | GPUs per pod. `infer.py` uses every GPU it sees, running stage 2 on the extra ones. |
 | `--runpod_disk_gb` | 100 | Container disk for the code, weights, clips, outputs, and `--low_vram` feature files. |
 | `--runpod_cloud_type` | `SECURE` | `COMMUNITY` is cheaper, with less availability. |
 | `--runpod_image` | `runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404` | Container image. It needs CUDA PyTorch and an SSH server that reads `PUBLIC_KEY`, as Runpod's official images do. |
