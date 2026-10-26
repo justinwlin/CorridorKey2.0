@@ -120,10 +120,13 @@ class Remote:
             f"{target.user}@{target.host}",
         ]
 
+    def alive(self) -> bool:
+        return subprocess.run(self.ssh + ["true"], stdin=subprocess.DEVNULL,
+                              capture_output=True).returncode == 0
+
     def wait_ready(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
-        while subprocess.run(self.ssh + ["true"], stdin=subprocess.DEVNULL,
-                             capture_output=True).returncode != 0:
+        while not self.alive():
             if time.monotonic() > deadline:
                 raise TimeoutError(f"SSH not reachable after {timeout:.0f}s")
             time.sleep(5)
@@ -249,6 +252,10 @@ def machine_worker(number: int, args, provider: Provider, machines: Machines,
             try:
                 run_clip(remote, clip, code_dir, job_dir, infer_args)
             except Exception as e:
+                if not remote.alive():
+                    # The machine is gone, not the clip. Leave it for another machine.
+                    jobs.put(clip)
+                    raise RuntimeError(f"lost connection while processing {clip.name}") from e
                 results[clip.index] = f"failed: {e}"
                 log(label, f"{clip.name} failed: {e}")
             else:

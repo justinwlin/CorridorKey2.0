@@ -13,8 +13,8 @@ For each run it:
 4. Runs `infer.py` on each clip and downloads the outputs.
 5. Releases the machines, including when the run fails or you press Ctrl-C.
 
-Runpod is the supported provider today. Adding another provider is described
-in [Adding a provider](#adding-a-provider).
+Runpod is the first supported provider. Others can be added without changing
+the runner, see [Adding a provider](#adding-a-provider).
 
 ## Runpod
 
@@ -88,16 +88,14 @@ Runpod console; pods then start in that volume's data center.
 
 ## Adding a provider
 
-A provider rents a CUDA Linux machine that accepts an SSH key, reports its SSH
-address, and releases it. Everything else runs over SSH and is shared by all
-providers.
+Any cloud that rents a CUDA Linux machine with SSH access can be added in one
+file of about 100 lines. See [ADDING_A_PROVIDER.md](ADDING_A_PROVIDER.md) for
+the interface, the machine requirements, and a testing checklist.
 
-1. Add `remote/providers/<name>.py` with a subclass of
-   `remote.providers.base.Provider` that implements `create`, `wait_for_ssh`,
-   and `destroy`. Add its flags in `add_arguments`, prefixed with its name.
-2. Register it in `PROVIDERS` in `remote/providers/__init__.py`.
+## Tests
 
-The machine needs a CUDA build of PyTorch, `python` and `pip` on the `PATH`,
-root access (to install `ffmpeg` if it is missing), and `flock`.
-`remote/setup_machine.sh` does the rest. `remote/providers/runpod.py` is a
-complete example.
+```
+python remote/tests/test_run.py
+```
+
+The tests use a fake provider, so they need no cloud account or GPU.

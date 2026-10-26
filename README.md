@@ -74,8 +74,9 @@ python run_interactive.py /path/to/clip.mp4
 ## Cloud GPUs
 
 No NVIDIA GPU, or a folder of clips to get through quickly? `remote/run.py`
-rents GPUs from a cloud provider (Runpod today), runs the same `infer.py`
-there, and downloads the outputs:
+rents GPUs from a cloud provider, runs the same `infer.py` there, and
+downloads the outputs. Runpod is the first provider supported, and others can
+be added:
 
 ```
 export RUNPOD_API_KEY=your_key
