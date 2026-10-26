@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 
-from .base import Provider, SSHTarget
+from ..base import Provider, SSHTarget
 
 
 def parse_host(value: str) -> SSHTarget:

@@ -8,6 +8,8 @@ these tests cover the runner's scheduling and cleanup, not a real provider.
 
 from __future__ import annotations
 
+import json
+import os
 import sys
 import tempfile
 import threading
@@ -20,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 
 from remote import run  # noqa: E402
 from remote.providers import Provider, SSHTarget  # noqa: E402
-from remote.providers.ssh import SSHProvider, parse_host  # noqa: E402
+from remote.providers.ssh import parse_host  # noqa: E402
 
 
 class FakeProvider(Provider):
@@ -248,6 +250,95 @@ class SSHCommandTest(unittest.TestCase):
         ssh = run.Remote(SSHTarget("1.2.3.4", 22022, "root"), Path("/tmp/run_key"), "m").ssh
         self.assertEqual(ssh[1:5], ["-i", "/tmp/run_key", "-p", "22022"])
         self.assertIn("StrictHostKeyChecking=no", ssh)
+
+
+class RunpodProviderTest(unittest.TestCase):
+    """The Runpod v2 provider with the HTTP layer replaced by canned responses."""
+
+    def provider(self, responses, **flags):
+        from remote.providers.runpod import provider as rp
+        args = mock.Mock(runpod_gpu=flags.get("gpus"), runpod_image="img",
+                         runpod_cloud_type="SECURE",
+                         runpod_network_volume=flags.get("volume"),
+                         runpod_volume_gb=60)
+        calls = []
+
+        def fake_request(self, method, path, body=None):
+            calls.append((method, path, json.loads(json.dumps(body))))
+            result = responses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with mock.patch.dict(os.environ, {"RUNPOD_API_KEY": "test"}), \
+                mock.patch.object(rp.RunpodProvider, "_request", fake_request):
+            provider = rp.RunpodProvider(args)
+        provider._request = lambda *a, **k: fake_request(provider, *a, **k)
+        return provider, calls, rp
+
+    def test_tries_gpu_types_in_order_until_one_is_available(self):
+        from remote.providers.runpod.provider import RunpodAPIError
+        provider, calls, _ = self.provider([
+            RunpodAPIError("POST", "/pods", 400, "no instances available"),
+            {"id": "pod1", "cost": 0.59},
+        ], gpus=["GPU A", "GPU B", "GPU C"])
+        self.assertEqual(provider.create("ck", "ssh-ed25519 AAAA"), "pod1")
+        self.assertEqual([c[2]["gpu"]["id"] for c in calls], ["GPU A", "GPU B"])
+        body = calls[-1][2]
+        self.assertEqual(body["gpu"], {"id": "GPU B", "count": 1, "minCudaVersion": "12.8"})
+        self.assertEqual(body["env"], {"PUBLIC_KEY": "ssh-ed25519 AAAA"})
+        self.assertEqual(body["mounts"], {"persistent": {"size": 60, "path": "/workspace"}})
+        self.assertNotIn("dataCenterIds", body)
+
+    def test_reports_every_gpu_when_none_can_be_rented(self):
+        from remote.providers.runpod.provider import RunpodAPIError
+        provider, _, _ = self.provider([
+            RunpodAPIError("POST", "/pods", 400, "no instances available"),
+            RunpodAPIError("POST", "/pods", 422, "unknown GPU type"),
+        ], gpus=["GPU A", "GPU B"])
+        with self.assertRaisesRegex(RuntimeError, "GPU A: no instances.*\n.*GPU B: unknown"):
+            provider.create("ck", "key")
+
+    def test_auth_errors_are_not_retried_on_other_gpus(self):
+        from remote.providers.runpod.provider import RunpodAPIError
+        provider, calls, _ = self.provider([
+            RunpodAPIError("POST", "/pods", 401, "unauthorized"),
+        ], gpus=["GPU A", "GPU B"])
+        with self.assertRaises(RunpodAPIError):
+            provider.create("ck", "key")
+        self.assertEqual(len(calls), 1)
+
+    def test_network_volume_mounts_and_pins_the_data_center(self):
+        provider, calls, _ = self.provider([
+            {"id": "vol1", "dataCenter": "EU-RO-1"},
+            {"id": "pod1"},
+        ], gpus=["GPU A"], volume="vol1")
+        provider.create("ck", "key")
+        self.assertEqual(calls[0][:2], ("GET", "/network-volumes/vol1"))
+        body = calls[1][2]
+        self.assertEqual(body["mounts"], {"network": [{"volumeId": "vol1", "path": "/workspace"}]})
+        self.assertEqual(body["dataCenterIds"], ["EU-RO-1"])
+
+    def test_waits_for_the_direct_ssh_endpoint(self):
+        provider, _, rp = self.provider([
+            {"status": "PROVISIONING", "ssh": {"proxy": None, "direct": None}},
+            {"status": "RUNNING", "ssh": {"proxy": {"host": "ssh.runpod.io"},
+                                          "direct": {"host": "1.2.3.4", "port": 22022,
+                                                     "username": "root"}}},
+        ])
+        with mock.patch.object(rp.time, "sleep"):
+            target = provider.wait_for_ssh("pod1", 60)
+        self.assertEqual(target, SSHTarget("1.2.3.4", 22022, "root"))
+
+    def test_stopped_pod_fails_instead_of_waiting(self):
+        provider, _, _ = self.provider([{"status": "ERROR", "ssh": {}}])
+        with self.assertRaisesRegex(RuntimeError, "ERROR"):
+            provider.wait_for_ssh("pod1", 60)
+
+    def test_destroying_a_deleted_pod_is_fine(self):
+        from remote.providers.runpod.provider import RunpodAPIError
+        provider, _, _ = self.provider([RunpodAPIError("DELETE", "/pods/x", 404, "not found")])
+        provider.destroy("x")
 
 
 class MachinesTest(unittest.TestCase):

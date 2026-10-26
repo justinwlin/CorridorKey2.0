@@ -24,7 +24,19 @@ echo "[setup] installing Python requirements"
 # which Ubuntu 24.04 otherwise refuses to pip install into (PEP 668). On your
 # own machines, point --ssh_python at a virtual environment instead.
 export PIP_BREAK_SYSTEM_PACKAGES=1
-"$PY" -m pip install -q --root-user-action=ignore -r requirements.txt
+# Keep the machine's PyTorch. Unconstrained, pip has replaced the image's
+# torch 2.9.1 with a newer release that CorridorKey is not tested with.
+"$PY" - > .torch-constraints.txt <<'PYEOF'
+import importlib.metadata as md
+for name in ("torch", "torchvision"):
+    try:
+        print(f"{name}=={md.version(name)}")
+    except md.PackageNotFoundError:
+        pass
+PYEOF
+echo "[setup] keeping $(tr '\n' ' ' < .torch-constraints.txt)"
+"$PY" -m pip install -q --root-user-action=ignore -c .torch-constraints.txt -r requirements.txt
+"$PY" -c "import torch; print('[setup] torch after install:', torch.__version__)"
 
 # Machines sharing a network volume share the weights; only one downloads.
 echo "[setup] checking model weights"

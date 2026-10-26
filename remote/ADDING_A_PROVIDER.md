@@ -1,18 +1,19 @@
 # Adding a GPU provider
 
 `remote/run.py` can run CorridorKey on any machine reachable over SSH. A
-provider is one Python file that supplies those machines: it starts one,
-reports its SSH address, and shuts it down. The shared runner does the rest
+provider supplies those machines: it starts one, reports its SSH address, and
+shuts it down. Each provider lives in its own folder under
+`remote/providers/`, with its code and a README for its users. The shared runner does the rest
 over SSH: uploading code and clips, setup, inference, downloads, spreading
 clips across machines, and cleanup.
 
 Two providers ship with it:
 
-- `remote/providers/ssh.py` (about 70 lines) uses machines the user already
-  has. Nothing is started or stopped. It is the smallest example of the
-  interface.
-- `remote/providers/runpod.py` (about 120 lines) rents pods through a REST
-  API. Copy it for a cloud provider.
+- [`providers/ssh`](providers/ssh) uses machines the user already has.
+  Nothing is started or stopped. At about 70 lines it is the smallest
+  example of the interface.
+- [`providers/runpod`](providers/runpod) rents pods through the Runpod REST
+  API v2. Copy it for a cloud provider.
 
 If a cloud gives users a machine they can already SSH into, `--provider ssh`
 works with it today, and a dedicated provider is only needed to start and
@@ -53,16 +54,23 @@ If the provider's images don't meet these, choose a different image in
 
 ## Steps
 
-### 1. Write the provider
+### 1. Create the provider folder
 
-Create `remote/providers/<name>.py`:
+```
+remote/providers/<name>/
+    __init__.py     from .provider import ExampleProvider
+    provider.py     the provider class
+    README.md       setup and flags for users of this provider
+```
+
+`provider.py`:
 
 ```python
 from __future__ import annotations
 
 import os
 
-from .base import Provider, SSHTarget
+from ..base import Provider, SSHTarget
 
 
 class ExampleProvider(Provider):
@@ -106,6 +114,7 @@ from .example import ExampleProvider
 
 PROVIDERS = {
     RunpodProvider.name: RunpodProvider,
+    SSHProvider.name: SSHProvider,
     ExampleProvider.name: ExampleProvider,
 }
 ```
@@ -114,9 +123,13 @@ Users then run `python remote/run.py --provider example ...`.
 
 ### 3. Document it
 
-Add a section for the provider to `remote/README.md`: the environment
-variable for the key, its flags with their defaults, and anything that costs
-money besides GPU time, such as storage that outlives the machine.
+Write `remote/providers/<name>/README.md` for people using the provider, in
+the same shape as [the Runpod one](providers/runpod/README.md): how to get an
+API key and which environment variable it goes in, a usage example, its flags
+with their defaults, and anything that costs money besides GPU time, such as
+storage that outlives the machine.
+
+Then add a row for it to the provider table in [README.md](README.md).
 
 ## Rules
 
@@ -140,14 +153,15 @@ money besides GPU time, such as storage that outlives the machine.
 ### Offline
 
 `remote/tests/test_run.py` runs the whole runner against a fake provider and
-a fake SSH layer:
+a fake SSH layer, and tests the Runpod provider against canned API responses:
 
 ```
 python remote/tests/test_run.py
 ```
 
 Run it after changing anything in `remote/`. Its `FakeProvider` is also a
-minimal working example of the interface.
+minimal working example of the interface, and `RunpodProviderTest` shows how
+to test a provider's API calls without a network.
 
 ### Against the real provider
 
