@@ -1,12 +1,22 @@
 # Adding a GPU provider
 
-`remote/run.py` can run CorridorKey on any cloud that rents a CUDA Linux
-machine reachable over SSH. A provider is one Python file of about 100 lines.
-It only starts a machine, reports its SSH address, and shuts it down. The
-shared runner does the rest over SSH: uploading code and clips, setup,
-inference, downloads, spreading clips across machines, and cleanup.
+`remote/run.py` can run CorridorKey on any machine reachable over SSH. A
+provider is one Python file that supplies those machines: it starts one,
+reports its SSH address, and shuts it down. The shared runner does the rest
+over SSH: uploading code and clips, setup, inference, downloads, spreading
+clips across machines, and cleanup.
 
-`remote/providers/runpod.py` is a complete example to copy.
+Two providers ship with it:
+
+- `remote/providers/ssh.py` (about 70 lines) uses machines the user already
+  has. Nothing is started or stopped. It is the smallest example of the
+  interface.
+- `remote/providers/runpod.py` (about 120 lines) rents pods through a REST
+  API. Copy it for a cloud provider.
+
+If a cloud gives users a machine they can already SSH into, `--provider ssh`
+works with it today, and a dedicated provider is only needed to start and
+stop machines automatically.
 
 ## How a run works
 
@@ -27,11 +37,13 @@ For each machine, the runner:
 
 - An NVIDIA GPU (RTX 30-series or newer) and a driver that supports
   CUDA 12.8.
-- `python` and `pip` on the `PATH`, with a CUDA build of PyTorch installed.
-  The README was tested with torch 2.9.1.
-- SSH as a user that can run `apt-get` (normally `root`), accepting the public
-  key passed to `create`. Most providers take the key as an API field, an
-  environment variable, or cloud-init user data.
+- A Python with a CUDA build of PyTorch and `pip`. Set the provider's
+  `python` attribute if it is not `python` on the `PATH`. The README was
+  tested with torch 2.9.1.
+- SSH that accepts the public key passed to `create`. Most providers take
+  the key as an API field, an environment variable, or cloud-init user data.
+- `ffmpeg`, or root access so `setup_machine.sh` can install it with
+  `apt-get`.
 - `bash`, `tar`, and `flock`. Ubuntu images have all three.
 - About 10 GB free under `workdir` for weights, plus room for clips and
   outputs. EXR output and `--low_vram` need much more.

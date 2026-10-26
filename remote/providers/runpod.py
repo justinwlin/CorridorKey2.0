@@ -110,7 +110,7 @@ class RunpodProvider(Provider):
                 raise RuntimeError(f"pod {instance_id} stopped: {pod.get('lastStatusChange')}")
             port = (pod.get("portMappings") or {}).get("22")
             if pod.get("publicIp") and port:
-                return SSHTarget(host=pod["publicIp"], port=int(port))
+                return SSHTarget(host=pod["publicIp"], port=int(port), user="root")
             time.sleep(5)
         raise TimeoutError(f"pod {instance_id} had no SSH endpoint after {timeout:.0f}s")
 

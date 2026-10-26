@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Run CorridorKey on rented cloud GPUs.
+"""Run CorridorKey on remote GPU machines.
 
-Rents one or more GPU machines from a provider, uploads this code and your
-clips, runs infer.py on each clip, downloads the outputs, and releases the
-machines. Flags not listed below are passed through to infer.py unchanged.
+Uses your own machines over SSH, or rents machines from a cloud provider for
+the run. Uploads this code and your clips, runs infer.py on each clip,
+downloads the outputs, and shuts down any machine it started. Flags not
+listed below are passed through to infer.py unchanged.
 
-    export RUNPOD_API_KEY=...
-    python remote/run.py --input shot.mp4 --output_dir out
-    python remote/run.py --input clips/ --output_dir out --machines 3 \\
-        --outputs alpha fg cutout
+    python remote/run.py --provider ssh --ssh_host gpu-box \\
+        --input shot.mp4 --output_dir out
+    RUNPOD_API_KEY=... python remote/run.py --input clips/ --output_dir out \\
+        --machines 3 --outputs alpha fg cutout
 
 A folder of clips is handled like the drag-and-drop launcher: each clip gets
 its own out_<clip> folder and companion hint files are picked up
@@ -106,23 +107,41 @@ def _batch_clip(index: int, clip: Path, out: Path) -> Clip:
 class Remote:
     """Shell commands and tar-over-SSH file transfer to one machine."""
 
-    def __init__(self, target: SSHTarget, key: Path, label: str):
+    def __init__(self, target: SSHTarget, run_key: Path, label: str, *,
+                 installs_run_key: bool = True):
         self.label = label
-        self.ssh = [
-            "ssh", "-i", str(key), "-p", str(target.port),
-            "-o", "StrictHostKeyChecking=no",
-            "-o", f"UserKnownHostsFile={os.devnull}",
+        key = target.identity_file or (run_key if installs_run_key else None)
+        self.ssh = ["ssh"]
+        if key:
+            self.ssh += ["-i", str(key)]
+        if target.port:
+            self.ssh += ["-p", str(target.port)]
+        if installs_run_key:
+            # A fresh machine has a new host key every time.
+            self.ssh += ["-o", "StrictHostKeyChecking=no",
+                         "-o", f"UserKnownHostsFile={os.devnull}"]
+        else:
+            self.ssh += ["-o", "StrictHostKeyChecking=accept-new"]
+        self.ssh += [
             "-o", "LogLevel=ERROR",
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=15",
             "-o", "ServerAliveInterval=30",
             "-o", "ServerAliveCountMax=6",
-            f"{target.user}@{target.host}",
+            f"{target.user}@{target.host}" if target.user else target.host,
         ]
 
     def alive(self) -> bool:
         return subprocess.run(self.ssh + ["true"], stdin=subprocess.DEVNULL,
                               capture_output=True).returncode == 0
+
+    def capture(self, command: str) -> str:
+        proc = subprocess.run(self.ssh + [command], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"remote command failed ({proc.returncode}): "
+                               f"{command}: {proc.stderr.strip()}")
+        return proc.stdout.strip()
 
     def wait_ready(self, timeout: float) -> None:
         deadline = time.monotonic() + timeout
@@ -204,9 +223,9 @@ class Machines:
 
 
 def run_clip(remote: Remote, clip: Clip, code_dir: str, job_dir: str,
-             infer_args: list[str]) -> None:
+             python: str, infer_args: list[str]) -> None:
     files = [(clip.input, f"in/{clip.input.name}")]
-    cmd = ["python", "infer.py",
+    cmd = [python, "infer.py",
            "--input", f"{job_dir}/in/{clip.input.name}",
            "--output_dir", f"{job_dir}/out"]
     if clip.hint_first_frame:
@@ -232,14 +251,17 @@ def machine_worker(number: int, args, provider: Provider, machines: Machines,
         instance_id = provider.create(f"corridorkey-{run_id}-{number}", public_key)
         machines.add(instance_id)
         target = provider.wait_for_ssh(instance_id, args.ready_timeout)
-        remote = Remote(target, key, label)
+        remote = Remote(target, key, label, installs_run_key=provider.installs_run_key)
         remote.wait_ready(args.ready_timeout)
-        log(label, f"connected: ssh -i {key} -p {target.port} {target.user}@{target.host}")
+        log(label, f"connected: {shlex.join(remote.ssh)}")
 
-        code_dir = f"{provider.workdir}/corridorkey"
+        # Absolute, because infer.py runs from code_dir and gets job paths.
+        workdir = remote.capture(f"mkdir -p {shlex.quote(provider.workdir)} && "
+                                 f"cd {shlex.quote(provider.workdir)} && pwd")
+        code_dir = f"{workdir}/corridorkey"
         remote.upload([(ROOT / p, p) for p in CODE_PATHS], code_dir)
         remote.run(f"bash {shlex.quote(code_dir)}/remote/setup_machine.sh "
-                   f"{shlex.quote(code_dir)}")
+                   f"{shlex.quote(code_dir)} {shlex.quote(provider.python)}")
 
         while True:
             try:
@@ -248,9 +270,9 @@ def machine_worker(number: int, args, provider: Provider, machines: Machines,
                 return
             log(label, f"processing {clip.name}")
             started = time.monotonic()
-            job_dir = f"{provider.workdir}/corridorkey_jobs/{run_id}/{clip.index:04d}"
+            job_dir = f"{workdir}/corridorkey_jobs/{run_id}/{clip.index:04d}"
             try:
-                run_clip(remote, clip, code_dir, job_dir, infer_args)
+                run_clip(remote, clip, code_dir, job_dir, provider.python, infer_args)
             except Exception as e:
                 if not remote.alive():
                     # The machine is gone, not the clip. Leave it for another machine.
@@ -280,8 +302,9 @@ def main():
                     help="Local first-frame matte, uploaded with the clip.")
     ap.add_argument("--hint_video", default=None,
                     help="Local hint video or frame directory, uploaded with the clip.")
-    ap.add_argument("--machines", type=int, default=1,
-                    help="GPU machines to rent in parallel for a folder of clips.")
+    ap.add_argument("--machines", type=int, default=None,
+                    help="Machines to use in parallel for a folder of clips. "
+                         "Default: 1 for rented machines, every --ssh_host for ssh.")
     ap.add_argument("--ready_timeout", type=float, default=900,
                     help="Seconds to wait for a machine to accept SSH.")
     ap.add_argument("--keep_machines", action="store_true",
@@ -293,7 +316,8 @@ def main():
 
     clips = collect_clips(args)
     provider = PROVIDERS[args.provider](args)
-    count = max(1, min(args.machines, len(clips)))
+    limit = provider.max_machines
+    count = min(args.machines or limit or 1, limit or len(clips), len(clips))
     run_id = uuid.uuid4().hex[:8]
     print(f"{len(clips)} clip(s) on {count} {provider.name} machine(s), run {run_id}")
 

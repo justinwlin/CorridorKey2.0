@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 
 from remote import run  # noqa: E402
 from remote.providers import Provider, SSHTarget  # noqa: E402
+from remote.providers.ssh import SSHProvider, parse_host  # noqa: E402
 
 
 class FakeProvider(Provider):
@@ -60,9 +61,14 @@ class FakeRemote:
     kill_on: set[str] = set()
     commands: list[tuple[str, str]] = []
 
-    def __init__(self, target, key, label):
+    def __init__(self, target, key, label, *, installs_run_key=True):
         self.host = target.host
+        self.ssh = ["ssh", target.host]
         self.dead = False
+
+    def capture(self, command):
+        FakeRemote.commands.append((self.host, command))
+        return "/home/artist/work"
 
     def alive(self):
         return not self.dead
@@ -90,7 +96,9 @@ class FakeRemote:
         (local_dir / "alpha.mp4").write_bytes(b"")
 
 
-class RunnerTest(unittest.TestCase):
+class Fixtures:
+    """Three clips with companion hints, a fake provider, and a fake SSH layer."""
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -121,6 +129,8 @@ class RunnerTest(unittest.TestCase):
     def infer_commands(self):
         return [cmd for _, cmd in FakeRemote.commands if "infer.py" in cmd]
 
+
+class RunnerTest(Fixtures, unittest.TestCase):
     def test_batch_spreads_clips_and_releases_every_machine(self):
         code = self.main("--input", str(self.clips), "--output_dir", str(self.tmp / "out"),
                          "--machines", "2", "--outputs", "alpha", "fg")
@@ -176,6 +186,68 @@ class RunnerTest(unittest.TestCase):
             run.collect_clips(mock.Mock(
                 input=str(self.clips), output_dir=str(self.tmp / "out"),
                 hint_first_frame=str(self.clips / "shot_aFrameHint.png"), hint_video=None))
+
+
+class SSHProviderTest(Fixtures, unittest.TestCase):
+    """The ssh provider against FakeRemote."""
+
+    def run_ssh(self, *argv):
+        with mock.patch.object(sys, "argv", ["run.py", "--provider", "ssh",
+                                             "--input", str(self.clips),
+                                             "--output_dir", str(self.tmp / "out"), *argv]):
+            try:
+                run.main()
+            except SystemExit as e:
+                return e.code or 0
+        return 0
+
+    def test_uses_every_host_by_default_and_runs_in_its_workdir(self):
+        code = self.run_ssh("--ssh_host", "artist@box1", "--ssh_host", "box2:2222",
+                            "--ssh_python", "/opt/ck/venv/bin/python")
+        self.assertEqual(code, 0)
+        self.assertEqual({host for host, _ in FakeRemote.commands}, {"box1", "box2"})
+        commands = self.infer_commands()
+        self.assertEqual(len(commands), 3)
+        self.assertTrue(all("cd /home/artist/work/corridorkey && /opt/ck/venv/bin/python "
+                            "infer.py --input /home/artist/work/corridorkey_jobs/" in c
+                            for c in commands))
+        setup = [c for _, c in FakeRemote.commands if "setup_machine.sh" in c]
+        self.assertTrue(all(c.endswith(" /opt/ck/venv/bin/python") for c in setup))
+
+    def test_machines_flag_can_use_fewer_hosts(self):
+        self.assertEqual(self.run_ssh("--ssh_host", "box1", "--ssh_host", "box2",
+                                      "--machines", "1"), 0)
+        self.assertEqual({host for host, _ in FakeRemote.commands}, {"box1"})
+
+    def test_hosts_flag_is_required(self):
+        with self.assertRaises(RuntimeError):
+            self.run_ssh()
+
+
+class SSHCommandTest(unittest.TestCase):
+    def test_parse_host(self):
+        self.assertEqual(parse_host("gpu-box"), SSHTarget("gpu-box"))
+        self.assertEqual(parse_host("me@10.0.0.5:2222"), SSHTarget("10.0.0.5", 2222, "me"))
+        self.assertEqual(parse_host("me@gpu-box"), SSHTarget("gpu-box", None, "me"))
+
+    def test_own_machine_uses_ssh_defaults_and_checks_host_keys(self):
+        ssh = run.Remote(SSHTarget("gpu-box"), Path("/tmp/run_key"), "m",
+                         installs_run_key=False).ssh
+        self.assertNotIn("-i", ssh)
+        self.assertNotIn("-p", ssh)
+        self.assertIn("StrictHostKeyChecking=accept-new", ssh)
+        self.assertEqual(ssh[-1], "gpu-box")
+
+    def test_own_machine_with_explicit_key(self):
+        ssh = run.Remote(SSHTarget("gpu-box", 2222, "me", "~/.ssh/studio"),
+                         Path("/tmp/run_key"), "m", installs_run_key=False).ssh
+        self.assertEqual(ssh[1:5], ["-i", "~/.ssh/studio", "-p", "2222"])
+        self.assertEqual(ssh[-1], "me@gpu-box")
+
+    def test_rented_machine_uses_run_key_without_host_key_checks(self):
+        ssh = run.Remote(SSHTarget("1.2.3.4", 22022, "root"), Path("/tmp/run_key"), "m").ssh
+        self.assertEqual(ssh[1:5], ["-i", "/tmp/run_key", "-p", "22022"])
+        self.assertIn("StrictHostKeyChecking=no", ssh)
 
 
 class MachinesTest(unittest.TestCase):
