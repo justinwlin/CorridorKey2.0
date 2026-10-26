@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -322,7 +323,9 @@ def precompute_rvm_to_memmap(model, source, meta, rvm_path: Path,
     else:
         chunks = iter_frame_dir_chunks(str(source), meta, chunk_size=chunk, need_model=False)
     state = None
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    # closing() runs after the executor joins, so an error also stops the
+    # frame decode threads behind `chunks`.
+    with closing(chunks), ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(_next_or_none, chunks)
         while True:
             item = future.result()
@@ -374,7 +377,9 @@ def precompute_foundations_to_memmap(model, source, meta, prefix: Path,
         chunks = iter_video_frame_chunks(str(source), meta, chunk_size=chunk, need_model=False)
     else:
         chunks = iter_frame_dir_chunks(str(source), meta, chunk_size=chunk, need_model=False)
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    # closing() runs after the executor joins, so an error also stops the
+    # frame decode threads behind `chunks`.
+    with closing(chunks), ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(_next_or_none, chunks)
         while True:
             item = future.result()

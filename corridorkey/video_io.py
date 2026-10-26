@@ -344,6 +344,9 @@ def preprocess_frame_dir_path(path: str, meta: dict, *, need_model: bool):
 # Decoded frames held ahead of the consumer, in bytes. A 4K frame with model
 # and display tensors is ~100 MB, so this allows ~20 frames at 4K.
 PREFETCH_BYTES = 2 << 30
+# Working memory of frames being decoded at once. One 4K EXR decode peaks at
+# ~640 MB (about 6.5x the native float32 frame), so this allows ~6 at 4K.
+DECODE_BYTES = 4 << 30
 
 
 def frame_workers(meta: dict) -> int:
@@ -359,23 +362,32 @@ def frame_bytes(meta: dict, *, tensors: int, channels: int = 3) -> int:
     return int(h) * int(w) * channels * 2 * tensors
 
 
+def decode_bytes(meta: dict, *, channels: int = 3) -> int:
+    """Estimated peak working memory of decoding one frame."""
+    h, w = meta["native_hw"]
+    return int(h) * int(w) * channels * 4 * 7
+
+
 class OrderedPrefetch:
     """Iterates `fn(item)` over `items` in order, computing results ahead on a
     thread pool. Frame decode and color conversion release the GIL, so frames
     decode in parallel. Results are the same as a serial loop.
 
     At most `max_bytes // item_bytes` results, queued or finished, are held
-    ahead of the consumer. Use as a context manager or call close().
+    ahead of the consumer, and at most `max_work_bytes // work_bytes` items
+    are computed at once. Use as a context manager or call close().
     """
 
     def __init__(self, fn, items, *, workers: int, item_bytes: int,
-                 max_bytes: int = PREFETCH_BYTES):
+                 work_bytes: int = 0, max_bytes: int = PREFETCH_BYTES,
+                 max_work_bytes: int = DECODE_BYTES):
         self.fn = fn
         self.items = list(items)
         self.next_submit = 0
         self.pending = collections.deque()
         self.depth = max(1, min(2 * workers, max_bytes // max(1, item_bytes)))
-        workers = min(workers, self.depth)
+        workers = min(workers, self.depth,
+                      max(1, max_work_bytes // max(1, work_bytes)))
         self.pool = ThreadPoolExecutor(workers) if workers > 1 else None
         self.closed = False
 
@@ -468,7 +480,8 @@ class SequentialFrameDirWindowReader:
         self.frames = OrderedPrefetch(
             lambda path: preprocess_frame_dir_path(path, meta, need_model=True),
             self.paths, workers=frame_workers(meta),
-            item_bytes=frame_bytes(meta, tensors=2))
+            item_bytes=frame_bytes(meta, tensors=2),
+            work_bytes=decode_bytes(meta))
 
     def close(self):
         self.frames.close()
@@ -527,7 +540,8 @@ def iter_frame_dir_chunks(frame_dir: str, meta: dict, *, chunk_size: int,
     frames = OrderedPrefetch(
         lambda path: preprocess_frame_dir_path(path, meta, need_model=need_model),
         paths, workers=frame_workers(meta),
-        item_bytes=frame_bytes(meta, tensors=2 if need_model else 1))
+        item_bytes=frame_bytes(meta, tensors=2 if need_model else 1),
+        work_bytes=decode_bytes(meta))
     with frames:
         t = 0
         while t < len(paths):
@@ -645,7 +659,8 @@ class SequentialHintFrameDirWindowReader:
             lambda path: preprocess_hint_frame(
                 cv2.imread(path, cv2.IMREAD_UNCHANGED), meta),
             self.paths[:int(meta["num_frames"])], workers=frame_workers(meta),
-            item_bytes=frame_bytes(meta, tensors=1, channels=1))
+            item_bytes=frame_bytes(meta, tensors=1, channels=1),
+            work_bytes=decode_bytes(meta, channels=4))
 
     def close(self):
         self.frames.close()

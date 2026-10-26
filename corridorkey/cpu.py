@@ -45,30 +45,52 @@ def _v1_quota(quota: str | None, period: str | None) -> float | None:
     return quota_us / period_us if quota_us > 0 and period_us > 0 else None
 
 
+def _cgroup_mounts(mountinfo: str):
+    """(mount root, mount point, is_v2, super options) for each cgroup mount."""
+    for line in (_read(mountinfo) or "").splitlines():
+        left, _, right = line.partition(" - ")
+        fields, fs = left.split(), right.split()
+        if len(fields) >= 5 and len(fs) >= 3 and fs[0] in ("cgroup", "cgroup2"):
+            yield fields[3], fields[4], fs[0] == "cgroup2", fs[2].split(",")
+
+
+def _dirs_to_check(rel: str, mount_root: str, mount_point: str):
+    """The process cgroup's directory under `mount_point`, then its parents.
+
+    /proc/self/cgroup paths are relative to the hierarchy root, while the
+    mount may expose only a subtree (`mount_root`). Without a cgroup
+    namespace a container sees e.g. /docker/<id> in both places.
+    """
+    root = mount_root.rstrip("/")
+    if rel == root or rel.startswith(root + "/"):
+        rel = rel[len(root):]
+    elif root:
+        rel = ""  # outside the mounted subtree: only the mount itself is visible
+    return _ancestors(mount_point, rel)
+
+
 def cgroup_cpu_limit(proc_cgroup: str = "/proc/self/cgroup",
-                     fs_root: str = "/sys/fs/cgroup") -> float | None:
+                     mountinfo: str = "/proc/self/mountinfo") -> float | None:
     """CPUs granted by the tightest cgroup quota over this process's cgroup
     and its ancestors, or None when there is no quota (or no cgroups)."""
+    mounts = list(_cgroup_mounts(mountinfo))
     limits = []
     for line in (_read(proc_cgroup) or "").splitlines():
         hierarchy, controllers, rel = (line.split(":", 2) + ["", ""])[:3]
         if hierarchy == "0" and controllers == "":
-            # cgroup v2: one unified hierarchy mounted at fs_root.
-            for d in _ancestors(fs_root, rel):
-                limits.append(_v2_quota(_read(os.path.join(d, "cpu.max"))))
+            # cgroup v2: one unified hierarchy.
+            for mount_root, mount_point, is_v2, _ in mounts:
+                if is_v2:
+                    for d in _dirs_to_check(rel, mount_root, mount_point):
+                        limits.append(_v2_quota(_read(os.path.join(d, "cpu.max"))))
         elif "cpu" in controllers.split(","):
-            # cgroup v1: the cpu controller is mounted as cpu, cpu,cpuacct,
-            # or cpuacct,cpu depending on the distribution.
-            for mount in (controllers, "cpu", "cpu,cpuacct", "cpuacct,cpu"):
-                mount_root = os.path.join(fs_root, mount)
-                if os.path.isdir(mount_root):
-                    break
-            else:
-                continue
-            for d in _ancestors(mount_root, rel):
-                limits.append(_v1_quota(
-                    _read(os.path.join(d, "cpu.cfs_quota_us")),
-                    _read(os.path.join(d, "cpu.cfs_period_us"))))
+            # cgroup v1: the hierarchy whose mount carries the cpu controller.
+            for mount_root, mount_point, is_v2, options in mounts:
+                if not is_v2 and "cpu" in options:
+                    for d in _dirs_to_check(rel, mount_root, mount_point):
+                        limits.append(_v1_quota(
+                            _read(os.path.join(d, "cpu.cfs_quota_us")),
+                            _read(os.path.join(d, "cpu.cfs_period_us"))))
     limits = [x for x in limits if x is not None]
     return min(limits) if limits else None
 
