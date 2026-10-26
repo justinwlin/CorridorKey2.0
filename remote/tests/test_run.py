@@ -260,7 +260,7 @@ class RunpodProviderTest(unittest.TestCase):
         args = mock.Mock(runpod_gpu=flags.get("gpus"), runpod_image="img",
                          runpod_cloud_type="SECURE",
                          runpod_network_volume=flags.get("volume"),
-                         runpod_volume_gb=60)
+                         runpod_disk_gb=100)
         calls = []
 
         def fake_request(self, method, path, body=None):
@@ -287,7 +287,10 @@ class RunpodProviderTest(unittest.TestCase):
         body = calls[-1][2]
         self.assertEqual(body["gpu"], {"id": "GPU B", "count": 1, "minCudaVersion": "12.8"})
         self.assertEqual(body["env"], {"PUBLIC_KEY": "ssh-ed25519 AAAA"})
-        self.assertEqual(body["mounts"], {"persistent": {"size": 60, "path": "/workspace"}})
+        # No volume by default: everything runs on the local container disk.
+        self.assertNotIn("mounts", body)
+        self.assertEqual(body["disk"], 100)
+        self.assertEqual(provider.workdir, "/corridorkey-remote")
         self.assertNotIn("dataCenterIds", body)
 
     def test_reports_every_gpu_when_none_can_be_rented(self):
@@ -318,6 +321,7 @@ class RunpodProviderTest(unittest.TestCase):
         body = calls[1][2]
         self.assertEqual(body["mounts"], {"network": [{"volumeId": "vol1", "path": "/workspace"}]})
         self.assertEqual(body["dataCenterIds"], ["EU-RO-1"])
+        self.assertEqual(provider.workdir, "/workspace")
 
     def test_waits_for_the_direct_ssh_endpoint(self):
         provider, _, rp = self.provider([

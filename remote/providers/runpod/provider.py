@@ -61,9 +61,9 @@ class RunpodProvider(Provider):
             help="Network volume id to mount at /workspace. The weights are "
                  "downloaded to it once and reused by later runs and by every "
                  "pod in this run. Pods start in the volume's data center.")
-        group.add_argument("--runpod_volume_gb", type=int, default=60,
-                           help="Pod volume size when no network volume is "
-                                "used. Holds weights, inputs, and outputs.")
+        group.add_argument("--runpod_disk_gb", type=int, default=100,
+                           help="Container disk in GB. Holds the code, weights, "
+                                "clips, outputs, and --low_vram feature files.")
 
     def __init__(self, args):
         super().__init__(args)
@@ -73,6 +73,10 @@ class RunpodProvider(Provider):
                 "Set RUNPOD_API_KEY to a Runpod API key "
                 "(https://console.runpod.io/user/settings).")
         self.mounts, self.data_centers = self._storage()
+        # The container disk is local to the host, so reading frames and the
+        # --low_vram feature files is fast. A network volume is only used to
+        # keep the weights between runs.
+        self.workdir = "/workspace" if self.mounts else "/corridorkey-remote"
 
     def _request(self, method: str, path: str, body: dict | None = None):
         data = json.dumps(body).encode() if body is not None else None
@@ -99,8 +103,7 @@ class RunpodProvider(Provider):
         """Mounts for /workspace, and the data centers they restrict pods to."""
         volume_id = self.args.runpod_network_volume
         if not volume_id:
-            return {"persistent": {"size": self.args.runpod_volume_gb,
-                                   "path": "/workspace"}}, []
+            return {}, []
         volume = self._request("GET", f"/network-volumes/{volume_id}")
         return ({"network": [{"volumeId": volume_id, "path": "/workspace"}]},
                 [volume["dataCenter"]])
@@ -111,12 +114,13 @@ class RunpodProvider(Provider):
             "image": self.args.runpod_image,
             "cloud": self.args.runpod_cloud_type,
             "ports": ["22/tcp"],
-            "disk": 30,
+            "disk": self.args.runpod_disk_gb,
             # Setting PUBLIC_KEY directly lets this run's throwaway key in
             # without registering keys on the account.
             "env": {"PUBLIC_KEY": public_key},
-            "mounts": self.mounts,
         }
+        if self.mounts:
+            body["mounts"] = self.mounts
         if self.data_centers:
             body["dataCenterIds"] = self.data_centers
         failures = []
