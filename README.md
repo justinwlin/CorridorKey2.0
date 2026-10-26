@@ -71,6 +71,19 @@ You can also start the same guided session directly:
 python run_interactive.py /path/to/clip.mp4
 ```
 
+## Cloud GPUs
+
+No NVIDIA GPU, or a folder of clips to get through quickly? `remote/run.py`
+rents GPUs from a cloud provider (Runpod today), runs the same `infer.py`
+there, and downloads the outputs:
+
+```
+export RUNPOD_API_KEY=your_key
+python remote/run.py --input clips/ --output_dir out --machines 3
+```
+
+See [remote/README.md](remote/README.md).
+
 ## Quick Start
 
 From the repository root:
