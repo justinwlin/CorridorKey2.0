@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -62,6 +63,9 @@ class FakeRemote:
     fail_clips: set[str] = set()
     kill_on: set[str] = set()
     commands: list[tuple[str, str]] = []
+    uploads: list[str] = []
+    # Set by a test to block setup until a clip upload has started.
+    setup_waits_for_clip_upload = False
 
     def __init__(self, target, key, label, *, installs_run_key=True):
         self.host = target.host
@@ -80,6 +84,12 @@ class FakeRemote:
 
     def run(self, command):
         FakeRemote.commands.append((self.host, command))
+        if "setup_machine.sh" in command and FakeRemote.setup_waits_for_clip_upload:
+            deadline = time.monotonic() + 5
+            while not any("corridorkey_jobs" in d for d in FakeRemote.uploads):
+                if time.monotonic() > deadline:
+                    raise RuntimeError("no clip upload started during setup")
+                time.sleep(0.01)
         if "infer.py" in command:
             for name in FakeRemote.kill_on:
                 if name in command:
@@ -92,6 +102,7 @@ class FakeRemote:
     def upload(self, files, dest):
         for local, _ in files:
             assert Path(local).exists(), local
+        FakeRemote.uploads.append(dest)
 
     def download(self, src, local_dir):
         local_dir.mkdir(parents=True, exist_ok=True)
@@ -112,6 +123,7 @@ class Fixtures:
         (self.clips / "shot_aFrameHint.png").write_bytes(b"")
         (self.clips / "shot_b_AlphaHint.mp4").write_bytes(b"")
         FakeRemote.fail_clips, FakeRemote.kill_on, FakeRemote.commands = set(), set(), []
+        FakeRemote.uploads, FakeRemote.setup_waits_for_clip_upload = [], False
         FakeProvider.fail_wait = False
         for patch in (mock.patch.dict(run.PROVIDERS, {"fake": FakeProvider}),
                       mock.patch.object(run, "Remote", FakeRemote)):
@@ -148,6 +160,12 @@ class RunnerTest(Fixtures, unittest.TestCase):
         self.assertIn("--hint_first_frame", by_clip["a"])
         self.assertIn("--hint_video", by_clip["b"])
         self.assertNotIn("--hint", by_clip["c"])
+
+    def test_first_clip_uploads_while_setup_runs(self):
+        FakeRemote.setup_waits_for_clip_upload = True
+        code = self.main("--input", str(self.clips), "--output_dir", str(self.tmp / "out"))
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.infer_commands()), 3)
 
     def test_never_rents_more_machines_than_clips(self):
         code = self.main("--input", str(self.clips / "shot_c.mp4"),

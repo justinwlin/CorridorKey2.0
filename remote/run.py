@@ -30,6 +30,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -222,8 +223,15 @@ class Machines:
                 print(f"[error] could not release {instance_id}, delete it by hand: {e}")
 
 
-def run_clip(remote: Remote, clip: Clip, code_dir: str, job_dir: str,
-             python: str, infer_args: list[str]) -> None:
+@dataclass
+class Job:
+    clip: Clip
+    dir: str
+    files: list[tuple[Path, str]]
+    cmd: list[str]
+
+
+def plan_job(clip: Clip, job_dir: str, python: str, infer_args: list[str]) -> Job:
     files = [(clip.input, f"in/{clip.input.name}")]
     cmd = [python, "infer.py",
            "--input", f"{job_dir}/in/{clip.input.name}",
@@ -234,12 +242,7 @@ def run_clip(remote: Remote, clip: Clip, code_dir: str, job_dir: str,
     if clip.hint_video:
         files.append((clip.hint_video, f"hint_video/{clip.hint_video.name}"))
         cmd += ["--hint_video", f"{job_dir}/hint_video/{clip.hint_video.name}"]
-    cmd += infer_args
-
-    remote.upload(files, job_dir)
-    remote.run(f"cd {shlex.quote(code_dir)} && {shlex.join(cmd)}")
-    remote.download(f"{job_dir}/out", clip.output_dir)
-    remote.run(f"rm -rf {shlex.quote(job_dir)}")
+    return Job(clip, job_dir, files, cmd + infer_args)
 
 
 def machine_worker(number: int, args, provider: Provider, machines: Machines,
@@ -247,6 +250,12 @@ def machine_worker(number: int, args, provider: Provider, machines: Machines,
                    results: dict[int, str], run_id: str, infer_args: list[str]) -> None:
     label = f"machine {number}"
     instance_id = None
+    # Clips this machine has taken from the queue and not finished. They go
+    # back to the queue if the machine is lost.
+    held: list[Clip] = []
+    # Uploads run one at a time in the background, so a clip's upload
+    # overlaps machine setup or the previous clip's inference.
+    uploads = ThreadPoolExecutor(max_workers=1)
     try:
         instance_id = provider.create(f"corridorkey-{run_id}-{number}", public_key)
         machines.add(instance_id)
@@ -260,32 +269,49 @@ def machine_worker(number: int, args, provider: Provider, machines: Machines,
                                  f"cd {shlex.quote(provider.workdir)} && pwd")
         code_dir = f"{workdir}/corridorkey"
         remote.upload([(ROOT / p, p) for p in CODE_PATHS], code_dir)
-        remote.run(f"bash {shlex.quote(code_dir)}/remote/setup_machine.sh "
-                   f"{shlex.quote(code_dir)} {shlex.quote(provider.python)}")
 
-        while True:
+        def take() -> tuple[Job, Future] | None:
             try:
                 clip = jobs.get_nowait()
             except queue.Empty:
-                return
+                return None
+            held.append(clip)
+            job = plan_job(clip, f"{workdir}/corridorkey_jobs/{run_id}/{clip.index:04d}",
+                           provider.python, infer_args)
+            return job, uploads.submit(remote.upload, job.files, job.dir)
+
+        following = take()
+        if following is None:
+            return
+        remote.run(f"bash {shlex.quote(code_dir)}/remote/setup_machine.sh "
+                   f"{shlex.quote(code_dir)} {shlex.quote(provider.python)}")
+
+        while following:
+            (job, upload), following = following, take()
+            clip = job.clip
             log(label, f"processing {clip.name}")
             started = time.monotonic()
-            job_dir = f"{workdir}/corridorkey_jobs/{run_id}/{clip.index:04d}"
             try:
-                run_clip(remote, clip, code_dir, job_dir, provider.python, infer_args)
+                upload.result()
+                remote.run(f"cd {shlex.quote(code_dir)} && {shlex.join(job.cmd)}")
+                remote.download(f"{job.dir}/out", clip.output_dir)
+                remote.run(f"rm -rf {shlex.quote(job.dir)}")
             except Exception as e:
                 if not remote.alive():
-                    # The machine is gone, not the clip. Leave it for another machine.
-                    jobs.put(clip)
                     raise RuntimeError(f"lost connection while processing {clip.name}") from e
                 results[clip.index] = f"failed: {e}"
                 log(label, f"{clip.name} failed: {e}")
             else:
                 results[clip.index] = f"done in {time.monotonic() - started:.0f}s -> {clip.output_dir}"
                 log(label, f"{clip.name} done -> {clip.output_dir}")
+            held.remove(clip)
     except Exception as e:
         log(label, f"machine failed: {e}")
+        # The machine is gone, not the clips. Leave them for another machine.
+        for clip in held:
+            jobs.put(clip)
     finally:
+        uploads.shutdown(wait=False, cancel_futures=True)
         if instance_id:
             machines.release(instance_id)
 
