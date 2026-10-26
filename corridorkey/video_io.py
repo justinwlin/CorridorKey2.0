@@ -804,7 +804,8 @@ class ExrSequenceWriter:
 
     def __init__(self, dir_path: str, fps: float, size: tuple[int, int], *,
                  channels: int = 3, dtype: str = "half", maxsize: int = 2,
-                 frame_name: str = "frame"):
+                 frame_name: str = "frame", workers: int | None = None,
+                 max_bytes: int = 1 << 30):
         if dtype not in ("half", "float"):
             raise ValueError(f"exr dtype must be 'half' or 'float', got {dtype!r}")
         self.dir_path = str(dir_path)
@@ -821,33 +822,33 @@ class ExrSequenceWriter:
         ]
         os.makedirs(self.dir_path, exist_ok=True)
         self.frame_idx = 0
-        self.q = queue.Queue(maxsize=maxsize)
+        # Each file is compressed on one thread, which is slow at 4K, so
+        # frames are written in parallel. At most `max_bytes` of frames (and
+        # never fewer than `maxsize`) wait in memory to be written.
+        w, h = size
+        frame_bytes = max(1, int(w) * int(h) * int(channels) * 4)
+        self.max_pending = max(int(maxsize), int(max_bytes) // frame_bytes)
+        workers = workers if workers and workers > 0 else available_cpus()
+        self.pool = ThreadPoolExecutor(max(1, min(workers, self.max_pending)))
+        self.pending = collections.deque()
         self.err = None
-        self.thread = threading.Thread(target=self._worker, daemon=True)
-        self.thread.start()
 
-    def _worker(self):
+    def _write_frame(self, idx: int, frame: np.ndarray):
+        if self.clamp_half:
+            # float16 overflows to inf above 65504; keep half EXRs finite
+            frame = np.clip(frame, -65504.0, 65504.0)
+        out_path = os.path.join(self.dir_path, f"{self.frame_name}_{idx:06d}.exr")
+        frame = np.ascontiguousarray(frame)
+        if frame.shape[-1] == 1:
+            frame = frame[..., 0]
+        if not cv2.imwrite(out_path, frame, self.imwrite_params):
+            raise RuntimeError(f"cv2.imwrite failed: {out_path}")
+
+    def _wait_oldest(self):
         try:
-            while True:
-                item = self.q.get()
-                if item is None:
-                    self.q.task_done()
-                    return
-                idx0, arr = item
-                if self.clamp_half:
-                    # float16 overflows to inf above 65504; keep half EXRs finite
-                    arr = np.clip(arr, -65504.0, 65504.0)
-                for j in range(arr.shape[0]):
-                    out_path = os.path.join(
-                        self.dir_path, f"{self.frame_name}_{idx0 + j:06d}.exr")
-                    frame = np.ascontiguousarray(arr[j])
-                    if frame.shape[-1] == 1:
-                        frame = frame[..., 0]
-                    if not cv2.imwrite(out_path, frame, self.imwrite_params):
-                        raise RuntimeError(f"cv2.imwrite failed: {out_path}")
-                self.q.task_done()
+            self.pending.popleft().result()
         except Exception as exc:
-            self.err = exc
+            self.err = self.err or exc
 
     def write_many(self, frames: np.ndarray):
         if self.err is not None:
@@ -859,15 +860,22 @@ class ExrSequenceWriter:
                 f"{self.channels} channels, got {arr.shape}")
         if arr.dtype != np.float32:
             raise ValueError(f"expected float32 frames, got {arr.dtype}")
-        self.q.put((self.frame_idx, arr))
-        self.frame_idx += arr.shape[0]
+        for j in range(arr.shape[0]):
+            while len(self.pending) >= self.max_pending:
+                self._wait_oldest()
+            if self.err is not None:
+                raise self.err
+            self.pending.append(
+                self.pool.submit(self._write_frame, self.frame_idx, arr[j]))
+            self.frame_idx += 1
 
     def write(self, frame: np.ndarray):
         self.write_many(frame[None])
 
     def release(self):
-        self.q.put(None)
-        self.thread.join()
+        while self.pending:
+            self._wait_oldest()
+        self.pool.shutdown(wait=True)
         if self.err is not None:
             raise self.err
 
