@@ -935,8 +935,11 @@ class ExrSequenceWriter:
                 self._wait_oldest()
             if self.err is not None:
                 raise self.err
+            # A view would keep the whole batch alive until its last frame
+            # is written, so frames from multi-frame batches get their own copy.
+            frame = arr[j] if arr.shape[0] == 1 else arr[j].copy()
             self.pending.append(
-                self.pool.submit(self._write_frame, self.frame_idx, arr[j]))
+                self.pool.submit(self._write_frame, self.frame_idx, frame))
             self.frame_idx += 1
 
     def write(self, frame: np.ndarray):
