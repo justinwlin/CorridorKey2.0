@@ -153,7 +153,7 @@ class Remote:
     def run(self, command: str) -> None:
         """Run a shell command remotely, streaming its output with our label."""
         proc = subprocess.Popen(
-            self.ssh + ["PYTHONUNBUFFERED=1 " + command], stdin=subprocess.DEVNULL,
+            self.ssh + ["export PYTHONUNBUFFERED=1; " + command], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
         for line in proc.stdout:
             log(self.label, line.rstrip())
