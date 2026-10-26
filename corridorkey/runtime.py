@@ -132,6 +132,12 @@ class InferenceConfig:
     frame_workers: int = 0
 
 
+# Frames waiting to be written, in bytes, shared by all EXR outputs. A 4K
+# float32 RGB frame is ~100 MB and takes ~2.6 s to compress, so each output
+# needs ~4 in flight to keep up with stage 2; this allows that for all four.
+EXR_WRITE_BYTES = 3 << 30
+
+
 # Peak GPU memory in GiB by megapixels of model input, measured at each Hann
 # chunk size. Keys are low_vram False/True.
 _VRAM_PEAK_GB = {
@@ -798,7 +804,8 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 writers[name] = ExrSequenceWriter(
                     os.path.join(output_dir, f"{clip_name}_{suffix[name]}_exr"),
                     fps, (W_out, H_out), channels=channels,
-                    dtype=cfg.exr_dtype, frame_name=suffix[name])
+                    dtype=cfg.exr_dtype, frame_name=suffix[name],
+                    max_bytes=EXR_WRITE_BYTES // len(cfg.outputs))
             else:
                 ext = ".mov" if name == "cutout" else ".mp4"
                 channels = 4 if name == "cutout" else 3
@@ -934,12 +941,20 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 reader.close()
                 del baton
     finally:
+        # Release every writer, even after one fails, so none is left with
+        # frames or threads behind; then raise the first error.
+        release_error = None
         for writer in writers.values():
-            writer.release()
+            try:
+                writer.release()
+            except Exception as exc:
+                release_error = release_error or exc
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_rvm_feat.f16")
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_baton.f16")
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_cradio.f32")
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_moge.f32")
         torch.cuda.empty_cache()
+        if release_error is not None:
+            raise release_error
     print(f"  wrote {len(writers)} output video(s) for {clip_name} "
           f"({T_all} frames @ {W_out}x{H_out})")
