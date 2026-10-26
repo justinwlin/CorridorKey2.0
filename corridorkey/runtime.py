@@ -786,6 +786,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
     checker = make_checker(H_out, W_out)
     checker_t = torch.from_numpy(checker)
     writers = {}
+    finished = False
     suffix = {
         "alpha": "alpha",
         "fg": "fg",
@@ -940,6 +941,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             finally:
                 reader.close()
                 del baton
+        finished = True
     finally:
         # Release every writer, even after one fails, so none is left with
         # frames or threads behind; then raise the first error.
@@ -955,6 +957,10 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
         safe_remove(cfg.temp_dir / f"{raw_clip_name(input_path)}_foundation_moge.f32")
         torch.cuda.empty_cache()
         if release_error is not None:
-            raise release_error
+            if not finished:
+                # Keep the error that stopped inference; report this one.
+                print(f"[WARNING] output writer also failed: {release_error}")
+            else:
+                raise release_error
     print(f"  wrote {len(writers)} output video(s) for {clip_name} "
           f"({T_all} frames @ {W_out}x{H_out})")

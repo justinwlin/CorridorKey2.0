@@ -797,7 +797,14 @@ class ThreadedVideoWriter:
         self.q.put(arr)
 
     def release(self):
-        self.q.put(None)
+        # If the worker died (e.g. ffmpeg exited), nothing drains a full
+        # queue, so a plain put() of the stop sentinel would block forever.
+        while self.thread.is_alive():
+            try:
+                self.q.put(None, timeout=1.0)
+                break
+            except queue.Full:
+                continue
         self.thread.join()
         if self.proc is not None and self.proc.stdin is not None:
             self.proc.stdin.close()
@@ -850,8 +857,9 @@ class ExrSequenceWriter:
 
     def _write_frame(self, idx: int, frame: np.ndarray):
         if self.clamp_half:
-            # float16 overflows to inf above 65504; keep half EXRs finite
-            frame = np.clip(frame, -65504.0, 65504.0)
+            # float16 overflows to inf above 65504; keep half EXRs finite.
+            # In place, so a 4K frame is not copied per writer thread.
+            np.clip(frame, -65504.0, 65504.0, out=frame)
         out_path = os.path.join(self.dir_path, f"{self.frame_name}_{idx:06d}.exr")
         frame = np.ascontiguousarray(frame)
         if frame.shape[-1] == 1:
@@ -866,6 +874,8 @@ class ExrSequenceWriter:
             self.err = self.err or exc
 
     def write_many(self, frames: np.ndarray):
+        """Queue frames for writing. Takes ownership of `frames`: half EXRs
+        clamp it in place, so the caller must not reuse the array."""
         if self.err is not None:
             raise self.err
         arr = np.ascontiguousarray(frames)
