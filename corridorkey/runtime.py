@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
+import queue
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass, field
@@ -130,6 +133,9 @@ class InferenceConfig:
     exr_dtype: str = "half"
     # Threads decoding image-sequence frames. 0 = one per usable CPU.
     frame_workers: int = 0
+    # GPUs to use. Stage 2 runs on every GPU past the first (and on all of
+    # them in low-VRAM mode). 0 = every visible GPU.
+    gpus: int = 0
 
 
 # Frames waiting to be written, in bytes, shared by all EXR outputs. A 4K
@@ -743,6 +749,123 @@ def _render_predictions_torch(meta: dict, outputs: set[str],
     return rendered
 
 
+def stage2_gpu_gb(megapixels: float, batch: int) -> float:
+    """GPU memory stage 2 needs: ~0.8 GiB of weights plus ~0.3 GiB per
+    megapixel per frame at peak (3.25 GiB for one 4K frame, measured on an
+    A40), plus room for rendering the outputs."""
+    return 0.8 + (0.3 * batch + 0.15) * megapixels + 1.0
+
+
+def stage2_devices(gpus: int, *, low_vram: bool,
+                   need_gb: float) -> list[torch.device]:
+    """GPUs that run stage 2. Normal mode keeps stage 1 on GPU 0, so stage 2
+    goes to the others; low-VRAM mode runs stage 2 alone, on all of them.
+    Extra GPUs without `need_gb` free are skipped."""
+    count = torch.cuda.device_count()
+    count = min(count, gpus) if gpus > 0 else count
+    ids = []
+    for i in range(1, count):
+        free_gb = torch.cuda.mem_get_info(i)[0] / 2**30
+        if free_gb >= need_gb:
+            ids.append(i)
+        else:
+            print(f"  [WARNING] not using cuda:{i} for stage 2: {free_gb:.1f} GB "
+                  f"free, needs about {need_gb:.1f} GB")
+    if low_vram or not ids:
+        ids = [0] + ids
+    return [torch.device("cuda", i) for i in ids]
+
+
+class Stage2Runner:
+    """Runs stage-2 batches on one or more GPUs and writes them in order.
+
+    Inline (threaded=False), each batch runs on the caller's thread, as a
+    plain loop would. Threaded, every copy of stage 2 gets a thread that
+    takes the next batch when its GPU is free, so stage 2 overlaps the
+    caller's own GPU work, and finished batches are written in submission
+    order. At most `max_pending` batches are queued or unwritten at once.
+    """
+
+    def __init__(self, modules, run_batch, write, *, threaded: bool,
+                 max_pending: int):
+        self.modules = modules
+        self.run_batch = run_batch
+        self.write = write
+        self.err = None
+        self.threads = []
+        if not threaded:
+            return
+        self.jobs = queue.Queue()
+        self.slots = threading.Semaphore(max(len(modules), max_pending))
+        self.lock = threading.Lock()
+        self.ready = threading.Condition(self.lock)
+        # Results wait in memory until every earlier batch is written, so a
+        # worker does not start a batch more than this far ahead of them.
+        self.ahead = 2 * len(modules)
+        self.finished = {}
+        self.next_submit = 0
+        self.next_write = 0
+        try:
+            for m in modules:
+                thread = threading.Thread(target=self._worker, args=(m,), daemon=True)
+                thread.start()
+                self.threads.append(thread)
+        except BaseException:
+            self.close()
+            raise
+
+    def submit(self, sub_items):
+        if not self.threads:
+            self.write(self.run_batch(self.modules[0], sub_items))
+            return
+        if self.err is not None:
+            raise self.err
+        self.slots.acquire()
+        self.jobs.put((self.next_submit, sub_items))
+        self.next_submit += 1
+
+    def _worker(self, module):
+        while True:
+            job = self.jobs.get()
+            if job is None:
+                return
+            seq, sub_items = job
+            with self.ready:
+                # The batch at next_write is always held by some worker (jobs
+                # are taken in order), so this cannot wait forever.
+                while seq >= self.next_write + self.ahead:
+                    self.ready.wait()
+            rendered = None
+            if self.err is None:
+                try:
+                    rendered = self.run_batch(module, sub_items)
+                except BaseException as exc:
+                    with self.lock:
+                        self.err = self.err or exc
+            with self.lock:
+                self.finished[seq] = rendered
+                while self.next_write in self.finished:
+                    ready = self.finished.pop(self.next_write)
+                    if ready is not None and self.err is None:
+                        try:
+                            self.write(ready)
+                        except BaseException as exc:
+                            self.err = exc
+                    self.next_write += 1
+                    self.slots.release()
+                self.ready.notify_all()
+
+    def close(self):
+        """Wait for every submitted batch, stop the threads, re-raise errors."""
+        for _ in self.threads:
+            self.jobs.put(None)
+        for thread in self.threads:
+            thread.join()
+        self.threads = []
+        if self.err is not None:
+            raise self.err
+
+
 def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                   writer_cfg: WriterConfig, *, initial_hint_path: str | None,
                   hint_video_path: str | None):
@@ -787,6 +910,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
     checker_t = torch.from_numpy(checker)
     writers = {}
     finished = False
+    stage2_runner = None
     suffix = {
         "alpha": "alpha",
         "fg": "fg",
@@ -874,6 +998,16 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
         else:
             rvm_feat_path = None
         foundation_paths = None
+        stage2_batch = max(1, int(cfg.stage2_batch))
+        devices = stage2_devices(
+            cfg.gpus, low_vram=cfg.low_vram,
+            need_gb=stage2_gpu_gb(H * W / 1e6, stage2_batch))
+        # Copies of stage 2 for the GPUs past the first, made while it is
+        # still on the CPU. model.stage2 itself runs on devices[0].
+        stage2_copies = [copy.deepcopy(model.stage2).to(d).eval()
+                         for d in devices[1:]]
+        if len(devices) > 1 or devices[0].index != 0:
+            print("  stage 2 on " + ", ".join(str(d) for d in devices))
         if cfg.low_vram:
             foundation_paths = precompute_foundations_to_memmap(
                 model, input_path, meta, foundation_prefix,
@@ -884,31 +1018,46 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
             model.stage1.cuda()
             torch.cuda.empty_cache()
         else:
-            model.stage2.cuda()
+            model.stage2.to(devices[0])
             model.stage2.eval()
             torch.cuda.empty_cache()
 
-        stage2_batch = max(1, int(cfg.stage2_batch))
+        render_fn = (_render_predictions_exr_torch if use_exr
+                     else _render_predictions_torch)
 
-        def write_prediction_batches(items):
-            device = next(model.stage2.parameters()).device
-            for offset in range(0, len(items), stage2_batch):
-                sub = items[offset:offset + stage2_batch]
+        def run_stage2_batch(stage2, sub):
+            device = next(stage2.parameters()).device
+            with torch.cuda.device(device):
                 rgb_t = torch.stack([item[2] for item in sub], dim=0)
                 rgb_t = rgb_t.unsqueeze(0).to(device, non_blocking=True)
                 baton_np = np.stack([item[1] for item in sub], axis=0)
                 baton_t = torch.from_numpy(baton_np).unsqueeze(0)
                 baton_t = baton_t.to(device, non_blocking=True).float()
                 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-                    logits = model.stage2(rgb_t, baton_t)
+                    logits = stage2(rgb_t, baton_t)
                     if isinstance(logits, tuple):
                         logits = logits[0]
-                render_fn = (_render_predictions_exr_torch if use_exr
-                             else _render_predictions_torch)
-                rendered = render_fn(meta, cfg.outputs, checker_t, logits[0])
-                for name, frames in rendered.items():
-                    writers[name].write_many(frames)
-                del logits, baton_t, rgb_t, baton_np, rendered
+                return render_fn(meta, cfg.outputs, checker_t, logits[0])
+
+        def write_rendered(rendered):
+            for name, frames in rendered.items():
+                writers[name].write_many(frames)
+
+        # Normal mode hands stage 2 a window's worth of frames at a time
+        # (already held in memory by stage 1), so queue that many; fewer would
+        # stall stage 1 until stage 2 caught up. Low-VRAM mode reads frames
+        # just for stage 2, so it keeps only a couple of batches per GPU.
+        # Threads whenever stage 2 has a GPU to itself, so it overlaps stage 1
+        # (normal mode) or the other stage-2 GPUs (low-VRAM mode).
+        stage2_runner = Stage2Runner(
+            [model.stage2] + stage2_copies, run_stage2_batch, write_rendered,
+            threaded=len(devices) > 1 or devices[0].index != 0,
+            max_pending=2 * len(devices) if cfg.low_vram else max(
+                2 * len(devices), -(-int(cfg.hann_chunk) // stage2_batch)))
+
+        def write_prediction_batches(items):
+            for offset in range(0, len(items), stage2_batch):
+                stage2_runner.submit(items[offset:offset + stage2_batch])
 
         hann_stage1_stream(
             model, input_path, meta, reader_cls=reader_cls,
@@ -924,6 +1073,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
 
         if cfg.low_vram:
             _phase2_setup(model)
+            model.stage2.to(devices[0])
             baton = np.memmap(
                 baton_path, dtype=np.float16, mode="r",
                 shape=(T_all, model.stage1.d_16, H // 16, W // 16))
@@ -943,9 +1093,14 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
                 del baton
         finished = True
     finally:
-        # Release every writer, even after one fails, so none is left with
-        # frames or threads behind; then raise the first error.
+        # Finish stage 2, then release every writer even after a failure, so
+        # nothing is left with frames or threads behind; raise the first error.
         release_error = None
+        if stage2_runner is not None:
+            try:
+                stage2_runner.close()
+            except Exception as exc:
+                release_error = exc
         for writer in writers.values():
             try:
                 writer.release()

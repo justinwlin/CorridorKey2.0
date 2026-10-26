@@ -123,6 +123,10 @@ def main():
     ap.add_argument("--frame_workers", type=int, default=0,
                     help="Threads decoding image-sequence frames ahead of the "
                          "GPU. Default 0: one per usable CPU.")
+    ap.add_argument("--gpus", type=int, default=0,
+                    help="GPUs to use. With more than one, stage 2 runs on the "
+                         "extra GPUs alongside stage 1 (or on all of them in "
+                         "--low_vram mode). Default 0: every visible GPU.")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
@@ -178,6 +182,7 @@ def main():
         output_format=args.output_format,
         exr_dtype=args.exr_dtype,
         frame_workers=args.frame_workers,
+        gpus=args.gpus,
     )
     model = load_model(paths, device="cuda")
     run_inference(
