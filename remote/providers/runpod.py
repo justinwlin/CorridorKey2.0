@@ -13,15 +13,20 @@ from .base import Provider, SSHTarget
 API_URL = "https://rest.runpod.io/v1"
 # Matches the torch 2.9.1 / CUDA 12.8 combination the README was tested with.
 DEFAULT_IMAGE = "runpod/pytorch:1.0.3-cu1281-torch291-ubuntu2404"
-# Tried in order. 48 GB cards get 80/40 Hann windows up to 1440p (see the
-# README VRAM table); the 24 GB 4090 is the fallback.
+# Tried in order: 48 GB cards first (80/40 Hann windows up to 1440p, see the
+# README VRAM table), then 24-32 GB cards, then larger cards. A long list keeps
+# runs starting when popular types are sold out.
 DEFAULT_GPUS = (
-    "NVIDIA L40S",
-    "NVIDIA RTX 6000 Ada Generation",
     "NVIDIA RTX A6000",
-    "NVIDIA L40",
     "NVIDIA A40",
+    "NVIDIA L40",
+    "NVIDIA RTX 6000 Ada Generation",
+    "NVIDIA L40S",
     "NVIDIA GeForce RTX 4090",
+    "NVIDIA GeForce RTX 5090",
+    "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+    "NVIDIA A100 80GB PCIe",
+    "NVIDIA A100-SXM4-80GB",
 )
 
 
@@ -80,7 +85,6 @@ class RunpodProvider(Provider):
             "gpuTypeIds": list(args.runpod_gpu or DEFAULT_GPUS),
             "gpuTypePriority": "custom",
             "gpuCount": 1,
-            "allowedCudaVersions": ["12.8", "12.9", "13.0"],
             "cloudType": args.runpod_cloud_type,
             "supportPublicIp": True,
             "ports": ["22/tcp"],

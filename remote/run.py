@@ -144,7 +144,7 @@ class Remote:
     def upload(self, files: list[tuple[Path, str]], dest: str) -> None:
         """Copy (local path, relative name) pairs into dest on the machine."""
         proc = subprocess.Popen(
-            self.ssh + [f"mkdir -p {shlex.quote(dest)} && tar xf - -C {shlex.quote(dest)}"],
+            self.ssh + [f"mkdir -p {shlex.quote(dest)} && tar xf - --no-same-owner -C {shlex.quote(dest)}"],
             stdin=subprocess.PIPE)
         skip = lambda info: None if "__pycache__" in info.name else info  # noqa: E731
         try:

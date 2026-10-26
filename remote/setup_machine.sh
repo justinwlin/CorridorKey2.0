@@ -14,6 +14,9 @@ python -c "import torch; assert torch.cuda.is_available(), 'no CUDA GPU visible'
 print('[setup] torch', torch.__version__, 'on', torch.cuda.get_device_name(0))"
 
 echo "[setup] installing Python requirements"
+# Rented machines are single-purpose and ship PyTorch in the system Python,
+# which Ubuntu 24.04 otherwise refuses to pip install into (PEP 668).
+export PIP_BREAK_SYSTEM_PACKAGES=1
 pip install -q --root-user-action=ignore -r requirements.txt
 
 # Machines sharing a network volume share the weights; only one downloads.
