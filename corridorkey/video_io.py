@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import glob
 import math
 import os
@@ -349,6 +350,35 @@ PREFETCH_BYTES = 2 << 30
 DECODE_BYTES = 4 << 30
 
 
+class ByteBudget:
+    """A byte count shared by threads: hold(n) waits until n more bytes fit.
+    A request larger than the whole budget runs alone."""
+
+    def __init__(self, limit: int):
+        self.limit = int(limit)
+        self.used = 0
+        self.cv = threading.Condition()
+
+    @contextlib.contextmanager
+    def hold(self, n: int):
+        n = min(int(n), self.limit)
+        with self.cv:
+            while self.used and self.used + n > self.limit:
+                self.cv.wait()
+            self.used += n
+        try:
+            yield
+        finally:
+            with self.cv:
+                self.used -= n
+                self.cv.notify_all()
+
+
+# One decode budget for the whole process, so readers running at the same
+# time (source frames and hint frames) share it.
+DECODE_BUDGET = ByteBudget(DECODE_BYTES)
+
+
 def frame_workers(meta: dict) -> int:
     """Threads for decoding image-sequence frames. meta["frame_workers"] <= 0
     or missing means one per CPU this process may use."""
@@ -375,12 +405,17 @@ class OrderedPrefetch:
 
     At most `max_bytes // item_bytes` results, queued or finished, are held
     ahead of the consumer, and at most `max_work_bytes // work_bytes` items
-    are computed at once. Use as a context manager or call close().
+    are computed at once, counted against the process-wide DECODE_BUDGET.
+    Use as a context manager or call close().
     """
 
     def __init__(self, fn, items, *, workers: int, item_bytes: int,
                  work_bytes: int = 0, max_bytes: int = PREFETCH_BYTES,
                  max_work_bytes: int = DECODE_BYTES):
+        if work_bytes > 0:
+            def fn(item, _fn=fn):
+                with DECODE_BUDGET.hold(work_bytes):
+                    return _fn(item)
         self.fn = fn
         self.items = list(items)
         self.next_submit = 0
@@ -794,7 +829,17 @@ class ThreadedVideoWriter:
                 f"expected batched frames as NHWC uint16 with {self.channels} channels, got {arr.shape}")
         if arr.dtype != np.uint16:
             raise ValueError(f"expected uint16 frames, got {arr.dtype}")
-        self.q.put(arr)
+        # A dead worker (e.g. ffmpeg exited) never drains the queue, so do
+        # not block on put() forever; surface its error instead.
+        while True:
+            try:
+                self.q.put(arr, timeout=1.0)
+                return
+            except queue.Full:
+                if self.err is not None:
+                    raise self.err
+                if not self.thread.is_alive():
+                    raise RuntimeError(f"ffmpeg writer stopped: {self.path}")
 
     def release(self):
         # If the worker died (e.g. ffmpeg exited), nothing drains a full
