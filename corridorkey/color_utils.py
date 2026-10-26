@@ -7,6 +7,12 @@ HDR_ASINH_REF = 16.0
 def _is_tensor(x):
     return isinstance(x, torch.Tensor)
 
+def _all_non_negative(t):
+    """True when every element is >= 0. False for any NaN, since NaN < 0 and
+    NaN >= 0 are both false and the full two-branch path handles it."""
+    return t.numel() > 0 and bool(t.min() >= 0)
+
+
 def _signed_pow(x, gamma):
     """Sign-preserving power. For x ≥ 0 this is identical to `x.pow(gamma)`.
     For x < 0 it returns -|x|^gamma — keeps the operation well-defined (no
@@ -50,6 +56,12 @@ def linear_to_srgb(x):
         return torch.where(x >= 0, pos, neg)
     
     t = torch.from_numpy(x)
+    if _all_non_negative(t):
+        # Same arithmetic as the positive branch below. Skipping the
+        # negative branch halves the work and leaves every value unchanged.
+        pos_t = t.clamp(min=0.0)
+        enc = pos_t.clamp(min=0.0031308).pow_(1.0 / 2.4).mul_(1.055).sub_(0.055)
+        return torch.where(pos_t <= 0.0031308, pos_t * 12.92, enc).numpy()
     pos_t = t.clamp(min=0.0)
     pos_pow = pos_t.clamp(min=0.0031308).pow(1.0 / 2.4)
     pos = torch.where(pos_t <= 0.0031308, pos_t * 12.92, 1.055 * pos_pow - 0.055)
@@ -79,6 +91,12 @@ def srgb_to_linear(x):
         return torch.where(x >= 0, pos, neg)
         
     t = torch.from_numpy(x)
+    if _all_non_negative(t):
+        # Same arithmetic as the positive branch below, without the
+        # negative branch that never applies to non-negative input.
+        pos_t = t.clamp(min=0.0)
+        dec = pos_t.add(0.055).div_(1.055).pow_(2.4)
+        return torch.where(pos_t <= 0.04045, pos_t / 12.92, dec).numpy()
     pos_t = t.clamp(min=0.0)
     pos_pow = ((pos_t + 0.055) / 1.055).pow(2.4)
     pos = torch.where(pos_t <= 0.04045, pos_t / 12.92, pos_pow)

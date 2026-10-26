@@ -19,6 +19,7 @@ from corridorkey.runtime import (
     load_model,
     run_inference,
 )
+from corridorkey.cpu import cgroup_cpu_limit, configure_cpu_threads
 from corridorkey.video_io import require_ffmpeg
 
 
@@ -115,11 +116,22 @@ def main():
     ap.add_argument("--low_vram_swin_window_batch", type=int, default=16)
     ap.add_argument("--low_vram_full_attn_query_chunk_tokens", type=int,
                     default=2048)
+    ap.add_argument("--cpu_threads", type=int, default=None,
+                    help="CPU threads for torch and OpenCV. Default: the CPUs "
+                         "this process may use, which inside a container is "
+                         "its CPU quota, not the host's core count.")
+    ap.add_argument("--frame_workers", type=int, default=0,
+                    help="Threads decoding image-sequence frames ahead of the "
+                         "GPU. Default 0: one per usable CPU.")
     args = ap.parse_args()
 
     if not torch.cuda.is_available():
         raise RuntimeError("CorridorKey v2 runtime requires a CUDA GPU.")
     require_ffmpeg(args.ffmpeg_bin)
+    threads = configure_cpu_threads(args.cpu_threads)
+    limit = cgroup_cpu_limit()
+    print(f"CPU threads: {threads}"
+          + (f" (container CPU limit {limit:g})" if limit is not None else ""))
     package_root = Path(__file__).resolve().parent
     paths = RuntimePaths.from_package(package_root, args.weights)
     writer_cfg = WriterConfig(
@@ -165,6 +177,7 @@ def main():
         despill_strength=args.despill_strength,
         output_format=args.output_format,
         exr_dtype=args.exr_dtype,
+        frame_workers=args.frame_workers,
     )
     model = load_model(paths, device="cuda")
     run_inference(

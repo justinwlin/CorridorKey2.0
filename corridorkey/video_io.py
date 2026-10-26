@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import glob
 import math
 import os
@@ -7,6 +8,7 @@ import queue
 import shutil
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +19,7 @@ import numpy as np
 import torch
 
 from . import color_utils as cu
+from .cpu import available_cpus
 
 
 @dataclass
@@ -338,6 +341,53 @@ def preprocess_frame_dir_path(path: str, meta: dict, *, need_model: bool):
     return model_t, display_t, display_t
 
 
+def frame_workers(meta: dict) -> int:
+    """Threads for decoding image-sequence frames. meta["frame_workers"] <= 0
+    or missing means one per CPU this process may use."""
+    workers = int(meta.get("frame_workers") or 0)
+    return workers if workers > 0 else available_cpus()
+
+
+class OrderedPrefetch:
+    """Iterates `fn(item)` over `items` in order, computing results ahead on a
+    thread pool. Frame decode and color conversion release the GIL, so one
+    frame per CPU runs in parallel. Results are the same as a serial loop."""
+
+    def __init__(self, fn, items, *, workers: int, lookahead: int | None = None):
+        self.fn = fn
+        self.items = list(items)
+        self.next_submit = 0
+        self.pending = collections.deque()
+        self.pool = ThreadPoolExecutor(workers) if workers > 1 else None
+        self.lookahead = max(1, lookahead if lookahead is not None else 2 * workers)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.pool is None:
+            if self.next_submit >= len(self.items):
+                raise StopIteration
+            self.next_submit += 1
+            return self.fn(self.items[self.next_submit - 1])
+        while (self.next_submit < len(self.items)
+               and len(self.pending) < self.lookahead):
+            self.pending.append(
+                self.pool.submit(self.fn, self.items[self.next_submit]))
+            self.next_submit += 1
+        if not self.pending:
+            raise StopIteration
+        return self.pending.popleft().result()
+
+    def close(self):
+        if self.pool is not None:
+            for future in self.pending:
+                future.cancel()
+            self.pending.clear()
+            self.pool.shutdown(wait=True)
+            self.pool = None
+
+
 class SequentialVideoWindowReader:
     def __init__(self, video_path: str, meta: dict):
         self.video_path = video_path
@@ -383,14 +433,16 @@ class SequentialFrameDirWindowReader:
         self.paths = meta["frame_paths"]
         self.next_t = 0
         self.cache: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self.frames = OrderedPrefetch(
+            lambda path: preprocess_frame_dir_path(path, meta, need_model=True),
+            self.paths, workers=frame_workers(meta))
 
     def close(self):
-        pass
+        self.frames.close()
 
     def _read_until(self, t_end: int):
         while self.next_t < t_end:
-            self.cache[self.next_t] = preprocess_frame_dir_path(
-                self.paths[self.next_t], self.meta, need_model=True)
+            self.cache[self.next_t] = next(self.frames)
             self.next_t += 1
 
     def window(self, t0: int, t1: int):
@@ -439,19 +491,25 @@ def iter_video_frame_chunks(video_path: str, meta: dict, *, chunk_size: int,
 def iter_frame_dir_chunks(frame_dir: str, meta: dict, *, chunk_size: int,
                           need_model: bool):
     paths = meta["frame_paths"]
-    t = 0
-    while t < len(paths):
-        t0 = t
-        model_list = [] if need_model else None
-        foundation_list = []
-        while t < len(paths) and len(foundation_list) < chunk_size:
-            model, foundation, _review = preprocess_frame_dir_path(
-                paths[t], meta, need_model=need_model)
-            if need_model:
-                model_list.append(model)
-            foundation_list.append(foundation)
-            t += 1
-        yield t0, (torch.stack(model_list) if need_model else None), torch.stack(foundation_list)
+    frames = OrderedPrefetch(
+        lambda path: preprocess_frame_dir_path(path, meta, need_model=need_model),
+        paths, workers=frame_workers(meta),
+        lookahead=max(2 * frame_workers(meta), 2 * chunk_size))
+    try:
+        t = 0
+        while t < len(paths):
+            t0 = t
+            model_list = [] if need_model else None
+            foundation_list = []
+            while t < len(paths) and len(foundation_list) < chunk_size:
+                model, foundation, _review = next(frames)
+                if need_model:
+                    model_list.append(model)
+                foundation_list.append(foundation)
+                t += 1
+            yield t0, (torch.stack(model_list) if need_model else None), torch.stack(foundation_list)
+    finally:
+        frames.close()
 
 
 def preprocess_hint_frame(frame_bgr, meta: dict) -> torch.Tensor:
@@ -552,14 +610,17 @@ class SequentialHintFrameDirWindowReader:
                 f"{meta['num_frames']} source frames")
         self.next_t = 0
         self.cache: dict[int, torch.Tensor] = {}
+        self.frames = OrderedPrefetch(
+            lambda path: preprocess_hint_frame(
+                cv2.imread(path, cv2.IMREAD_UNCHANGED), meta),
+            self.paths[:int(meta["num_frames"])], workers=frame_workers(meta))
 
     def close(self):
-        pass
+        self.frames.close()
 
     def _read_until(self, t_end: int):
         while self.next_t < t_end:
-            frame = cv2.imread(self.paths[self.next_t], cv2.IMREAD_UNCHANGED)
-            self.cache[self.next_t] = preprocess_hint_frame(frame, self.meta)
+            self.cache[self.next_t] = next(self.frames)
             self.next_t += 1
 
     def window(self, t0: int, t1: int):

@@ -127,6 +127,8 @@ class InferenceConfig:
     despill_strength: float = 0.5
     output_format: str = "video"
     exr_dtype: str = "half"
+    # Threads decoding image-sequence frames. 0 = one per usable CPU.
+    frame_workers: int = 0
 
 
 # Peak GPU memory in GiB by megapixels of model input, measured at each Hann
@@ -767,6 +769,7 @@ def run_inference(model, input_path: str, output_dir: str, cfg: InferenceConfig,
     H_out, W_out = meta["output_hw"]
     meta["cutout_linear"] = cfg.cutout_linear
     meta["despill_strength"] = cfg.despill_strength
+    meta["frame_workers"] = cfg.frame_workers
     fps = float(meta["native_fps"])
     clip_name = raw_clip_name(input_path)
     checker = make_checker(H_out, W_out)
