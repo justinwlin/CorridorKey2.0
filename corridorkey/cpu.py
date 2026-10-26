@@ -14,31 +14,63 @@ import math
 import os
 
 
-def _cgroup_v2_limit(path: str = "/sys/fs/cgroup/cpu.max") -> float | None:
+def _read(path: str) -> str | None:
     try:
-        quota, period = open(path).read().split()[:2]
-    except (OSError, ValueError):
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
         return None
-    if quota == "max":
-        return None
-    return int(quota) / int(period)
 
 
-def _cgroup_v1_limit(root: str = "/sys/fs/cgroup/cpu") -> float | None:
+def _ancestors(root: str, rel: str):
+    """`root/rel` and each parent directory up to `root`."""
+    parts = [p for p in rel.strip("/").split("/") if p and p != ".."]
+    for i in range(len(parts), -1, -1):
+        yield os.path.join(root, *parts[:i])
+
+
+def _v2_quota(text: str | None) -> float | None:
     try:
-        quota = int(open(os.path.join(root, "cpu.cfs_quota_us")).read())
-        period = int(open(os.path.join(root, "cpu.cfs_period_us")).read())
-    except (OSError, ValueError):
+        quota, period = text.split()[:2]
+        return None if quota == "max" else int(quota) / int(period)
+    except (AttributeError, ValueError, ZeroDivisionError):
         return None
-    if quota <= 0 or period <= 0:
-        return None
-    return quota / period
 
 
-def cgroup_cpu_limit() -> float | None:
-    """CPUs granted by the cgroup quota, or None when there is no quota."""
-    limit = _cgroup_v2_limit()
-    return limit if limit is not None else _cgroup_v1_limit()
+def _v1_quota(quota: str | None, period: str | None) -> float | None:
+    try:
+        quota_us, period_us = int(quota), int(period)
+    except (TypeError, ValueError):
+        return None
+    return quota_us / period_us if quota_us > 0 and period_us > 0 else None
+
+
+def cgroup_cpu_limit(proc_cgroup: str = "/proc/self/cgroup",
+                     fs_root: str = "/sys/fs/cgroup") -> float | None:
+    """CPUs granted by the tightest cgroup quota over this process's cgroup
+    and its ancestors, or None when there is no quota (or no cgroups)."""
+    limits = []
+    for line in (_read(proc_cgroup) or "").splitlines():
+        hierarchy, controllers, rel = (line.split(":", 2) + ["", ""])[:3]
+        if hierarchy == "0" and controllers == "":
+            # cgroup v2: one unified hierarchy mounted at fs_root.
+            for d in _ancestors(fs_root, rel):
+                limits.append(_v2_quota(_read(os.path.join(d, "cpu.max"))))
+        elif "cpu" in controllers.split(","):
+            # cgroup v1: the cpu controller is mounted as cpu, cpu,cpuacct,
+            # or cpuacct,cpu depending on the distribution.
+            for mount in (controllers, "cpu", "cpu,cpuacct", "cpuacct,cpu"):
+                mount_root = os.path.join(fs_root, mount)
+                if os.path.isdir(mount_root):
+                    break
+            else:
+                continue
+            for d in _ancestors(mount_root, rel):
+                limits.append(_v1_quota(
+                    _read(os.path.join(d, "cpu.cfs_quota_us")),
+                    _read(os.path.join(d, "cpu.cfs_period_us"))))
+    limits = [x for x in limits if x is not None]
+    return min(limits) if limits else None
 
 
 def visible_cpus() -> int:
